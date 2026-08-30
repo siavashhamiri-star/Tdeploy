@@ -1,0 +1,6 @@
+{
+  "name": "Tavana City",
+  "description": "شهر مجازی توانا - اکوسیستم دیجیتال و مردمی معرفی مشاغل، اصناف، تخصص‌ها، رفاقت، لیگ ارزش‌آفرینان و مشارکت",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
