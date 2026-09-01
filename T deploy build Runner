@@ -1,0 +1,52 @@
+name: Tdeploy Build Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Build Target"
+        required: true
+        default: "debug_apk"
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Grant Execute Permission to Gradle
+        run: chmod +x gradlew
+
+      - name: Build Debug APK
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Verify APK Exists
+        run: |
+          test -f app/build/outputs/apk/debug/app-debug.apk
+          echo "APK verified successfully."
+
+      - name: Compute SHA-256 Checksum
+        run: |
+          sha256sum app/build/outputs/apk/debug/app-debug.apk > app-debug.apk.sha256
+          cat app-debug.apk.sha256
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdeploy-debug-apk
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app-debug.apk.sha256
+          retention-days: 7
