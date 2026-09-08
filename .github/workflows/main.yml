@@ -1,0 +1,190 @@
+name: T-Deploy Universal Android Builder
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Universal Android APK & AAB
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # Detect project type
+      # --------------------------------------------------
+      - name: Detect Project Type
+        id: detect
+        shell: bash
+        run: |
+          set -e
+
+          if [ -f "package.json" ] && { [ -f "capacitor.config.ts" ] || [ -f "capacitor.config.json" ] || [ -d "android" ]; }; then
+            echo "type=hybrid" >> "$GITHUB_OUTPUT"
+            echo "Detected: Hybrid / Capacitor"
+          elif [ -f "gradlew" ] && [ -d "app" ]; then
+            echo "type=native" >> "$GITHUB_OUTPUT"
+            echo "Detected: Native Android"
+          elif [ -f "android/gradlew" ] && [ -d "android/app" ]; then
+            echo "type=native-subdir" >> "$GITHUB_OUTPUT"
+            echo "Detected: Android project in android/"
+          else
+            echo "Unable to detect a supported Android project."
+            exit 1
+          fi
+
+      # --------------------------------------------------
+      # Node.js / Hybrid preparation
+      # --------------------------------------------------
+      - name: Setup Node.js
+        if: steps.detect.outputs.type == 'hybrid'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install Node dependencies
+        if: steps.detect.outputs.type == 'hybrid'
+        run: npm install
+
+      - name: Install Capacitor Android
+        if: steps.detect.outputs.type == 'hybrid'
+        run: |
+          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+
+      - name: Build Web Application
+        if: steps.detect.outputs.type == 'hybrid'
+        run: npm run build
+
+      - name: Prepare Capacitor Android
+        if: steps.detect.outputs.type == 'hybrid'
+        run: |
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+          npx cap sync android
+
+      # --------------------------------------------------
+      # Java / Android SDK
+      # --------------------------------------------------
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+
+      # --------------------------------------------------
+      # Select Gradle project
+      # --------------------------------------------------
+      - name: Prepare Native Android
+        if: steps.detect.outputs.type == 'native'
+        run: chmod +x ./gradlew
+
+      - name: Prepare Android Subdirectory
+        if: steps.detect.outputs.type == 'native-subdir' || steps.detect.outputs.type == 'hybrid'
+        run: chmod +x android/gradlew
+
+      # --------------------------------------------------
+      # Build Native Android
+      # --------------------------------------------------
+      - name: Build Native Android
+        if: steps.detect.outputs.type == 'native'
+        run: |
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon
+          ./gradlew :app:assembleRelease --stacktrace --no-daemon
+          ./gradlew :app:bundleRelease --stacktrace --no-daemon
+
+      # --------------------------------------------------
+      # Build Android project inside android/
+      # --------------------------------------------------
+      - name: Build Android Subdirectory
+        if: steps.detect.outputs.type == 'native-subdir' || steps.detect.outputs.type == 'hybrid'
+        working-directory: android
+        run: |
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon
+          ./gradlew :app:assembleRelease --stacktrace --no-daemon
+          ./gradlew :app:bundleRelease --stacktrace --no-daemon
+
+      # --------------------------------------------------
+      # Verify artifacts
+      # --------------------------------------------------
+      - name: Verify Native Artifacts
+        if: steps.detect.outputs.type == 'native'
+        run: |
+          test -f app/build/outputs/apk/debug/app-debug.apk
+          test -f app/build/outputs/apk/release/app-release-unsigned.apk
+          test -f app/build/outputs/bundle/release/app-release.aab
+
+      - name: Verify Android Subdirectory Artifacts
+        if: steps.detect.outputs.type == 'native-subdir' || steps.detect.outputs.type == 'hybrid'
+        run: |
+          test -f android/app/build/outputs/apk/debug/app-debug.apk
+          test -f android/app/build/outputs/apk/release/app-release-unsigned.apk
+          test -f android/app/build/outputs/bundle/release/app-release.aab
+
+      # --------------------------------------------------
+      # Upload APK / AAB
+      # --------------------------------------------------
+      - name: Upload Native APK
+        if: steps.detect.outputs.type == 'native'
+        uses: actions/upload-artifact@v4
+        with:
+          name: T-Deploy-Debug-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload Native Release APK
+        if: steps.detect.outputs.type == 'native'
+        uses: actions/upload-artifact@v4
+        with:
+          name: T-Deploy-Release-APK
+          path: app/build/outputs/apk/release/app-release-unsigned.apk
+          if-no-files-found: error
+
+      - name: Upload Native AAB
+        if: steps.detect.outputs.type == 'native'
+        uses: actions/upload-artifact@v4
+        with:
+          name: T-Deploy-Release-AAB
+          path: app/build/outputs/bundle/release/app-release.aab
+          if-no-files-found: error
+
+      - name: Upload Hybrid / Subdirectory APK
+        if: steps.detect.outputs.type == 'native-subdir' || steps.detect.outputs.type == 'hybrid'
+        uses: actions/upload-artifact@v4
+        with:
+          name: T-Deploy-Debug-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload Hybrid / Subdirectory Release APK
+        if: steps.detect.outputs.type == 'native-subdir' || steps.detect.outputs.type == 'hybrid'
+        uses: actions/upload-artifact@v4
+        with:
+          name: T-Deploy-Release-APK
+          path: android/app/build/outputs/apk/release/app-release-unsigned.apk
+          if-no-files-found: error
+
+      - name: Upload Hybrid / Subdirectory AAB
+        if: steps.detect.outputs.type == 'native-subdir' || steps.detect.outputs.type == 'hybrid'
+        uses: actions/upload-artifact@v4
+        with:
+          name: T-Deploy-Release-AAB
+          path: android/app/build/outputs/bundle/release/app-release.aab
+          if-no-files-found: error
