@@ -2,9 +2,16 @@ name: T-Deploy Universal Android Builder
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+    inputs:
+      repository:
+        description: "GitHub repository (owner/name)"
+        required: true
+        type: string
+      branch:
+        description: "Branch to build"
+        required: true
+        default: "main"
+        type: string
 
 permissions:
   contents: read
@@ -15,176 +22,247 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout T-Deploy
         uses: actions/checkout@v4
 
-      # --------------------------------------------------
-      # Detect project type
-      # --------------------------------------------------
+      - name: Checkout Target Project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.branch }}
+          path: target
+          fetch-depth: 1
+
+      - name: Inspect Target Project
+        working-directory: target
+        shell: bash
+        run: |
+          echo "======================================"
+          echo "T-DEPLOY TARGET PROJECT"
+          echo "======================================"
+          echo "Repository: ${{ inputs.repository }}"
+          echo "Branch:     ${{ inputs.branch }}"
+          echo
+          echo "Top-level files:"
+          ls -la
+          echo
+          echo "Android / Gradle / Node files:"
+          find . -maxdepth 4 \
+            \( -name "gradlew" \
+            -o -name "settings.gradle" \
+            -o -name "settings.gradle.kts" \
+            -o -name "build.gradle" \
+            -o -name "build.gradle.kts" \
+            -o -name "package.json" \
+            -o -name "capacitor.config.ts" \
+            -o -name "capacitor.config.json" \) \
+            -print | sort
+
       - name: Detect Project Type
         id: detect
+        working-directory: target
         shell: bash
         run: |
           set -e
 
-          if [ -f "package.json" ] && { [ -f "capacitor.config.ts" ] || [ -f "capacitor.config.json" ] || [ -d "android" ]; }; then
-            echo "type=hybrid" >> "$GITHUB_OUTPUT"
-            echo "Detected: Hybrid / Capacitor"
-          elif [ -f "gradlew" ] && [ -d "app" ]; then
+          echo "Detecting Android project..."
+
+          if [ -f "gradlew" ] && [ -d "app" ]; then
             echo "type=native" >> "$GITHUB_OUTPUT"
-            echo "Detected: Native Android"
+            echo "android_dir=." >> "$GITHUB_OUTPUT"
+            echo "Detected: Native Android at repository root"
+
           elif [ -f "android/gradlew" ] && [ -d "android/app" ]; then
             echo "type=native-subdir" >> "$GITHUB_OUTPUT"
-            echo "Detected: Android project in android/"
+            echo "android_dir=android" >> "$GITHUB_OUTPUT"
+            echo "Detected: Native Android under android/"
+
+          elif [ -f "capacitor.config.ts" ] || [ -f "capacitor.config.json" ]; then
+            echo "type=hybrid" >> "$GITHUB_OUTPUT"
+            echo "android_dir=android" >> "$GITHUB_OUTPUT"
+            echo "Detected: Capacitor / Hybrid"
+
+          elif [ -f "package.json" ] && grep -q '"@capacitor/' package.json; then
+            echo "type=hybrid" >> "$GITHUB_OUTPUT"
+            echo "android_dir=android" >> "$GITHUB_OUTPUT"
+            echo "Detected: Capacitor / Hybrid"
+
           else
-            echo "Unable to detect a supported Android project."
+            echo "ERROR: Supported Android project not detected."
+            echo
+            echo "Complete project structure:"
+            find . -maxdepth 4 -type f | sort | head -500
             exit 1
           fi
 
-      # --------------------------------------------------
-      # Node.js / Hybrid preparation
-      # --------------------------------------------------
       - name: Setup Node.js
         if: steps.detect.outputs.type == 'hybrid'
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: npm
+          node-version: "20"
 
-      - name: Install Node dependencies
+      - name: Install Node Dependencies
         if: steps.detect.outputs.type == 'hybrid'
-        run: npm install
-
-      - name: Install Capacitor Android
-        if: steps.detect.outputs.type == 'hybrid'
+        working-directory: target
+        shell: bash
         run: |
-          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+          set -e
+
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
 
       - name: Build Web Application
         if: steps.detect.outputs.type == 'hybrid'
-        run: npm run build
-
-      - name: Prepare Capacitor Android
-        if: steps.detect.outputs.type == 'hybrid'
+        working-directory: target
+        shell: bash
         run: |
-          if [ ! -d "android" ]; then
-            npx cap add android
-          fi
-          npx cap sync android
+          set -e
 
-      # --------------------------------------------------
-      # Java / Android SDK
-      # --------------------------------------------------
-      - name: Setup JDK 17
+          if npm run | grep -q " build"; then
+            npm run build
+          else
+            echo "No npm build script found."
+            echo "Continuing with existing Android project."
+          fi
+
+      - name: Sync Capacitor
+        if: steps.detect.outputs.type == 'hybrid'
+        working-directory: target
+        shell: bash
+        run: |
+          set -e
+
+          if [ -d "android" ]; then
+            npx cap sync android
+          else
+            echo "ERROR: Capacitor project has no android directory."
+            exit 1
+          fi
+
+      - name: Setup JDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
           cache: gradle
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK packages
+      - name: Install Android SDK
+        shell: bash
         run: |
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
 
-      # --------------------------------------------------
-      # Select Gradle project
-      # --------------------------------------------------
-      - name: Prepare Native Android
-        if: steps.detect.outputs.type == 'native'
-        run: chmod +x ./gradlew
-
-      - name: Prepare Android Subdirectory
-        if: steps.detect.outputs.type == 'native-subdir' || steps.detect.outputs.type == 'hybrid'
-        run: chmod +x android/gradlew
-
-      # --------------------------------------------------
-      # Build Native Android
-      # --------------------------------------------------
-      - name: Build Native Android
-        if: steps.detect.outputs.type == 'native'
+      - name: Prepare Gradle Wrapper
+        working-directory: target
+        shell: bash
         run: |
+          set -e
+
+          if [ "${{ steps.detect.outputs.android_dir }}" = "." ]; then
+            chmod +x ./gradlew
+          else
+            chmod +x android/gradlew
+          fi
+
+      - name: Build Root Android Project
+        if: steps.detect.outputs.type == 'native'
+        working-directory: target
+        shell: bash
+        run: |
+          set -e
+
           ./gradlew :app:assembleDebug --stacktrace --no-daemon
           ./gradlew :app:assembleRelease --stacktrace --no-daemon
           ./gradlew :app:bundleRelease --stacktrace --no-daemon
 
-      # --------------------------------------------------
-      # Build Android project inside android/
-      # --------------------------------------------------
-      - name: Build Android Subdirectory
+      - name: Build Android Subdirectory Project
         if: steps.detect.outputs.type == 'native-subdir' || steps.detect.outputs.type == 'hybrid'
-        working-directory: android
+        working-directory: target/android
+        shell: bash
         run: |
+          set -e
+
           ./gradlew :app:assembleDebug --stacktrace --no-daemon
           ./gradlew :app:assembleRelease --stacktrace --no-daemon
           ./gradlew :app:bundleRelease --stacktrace --no-daemon
 
-      # --------------------------------------------------
-      # Verify artifacts
-      # --------------------------------------------------
-      - name: Verify Native Artifacts
-        if: steps.detect.outputs.type == 'native'
+      - name: Find Build Artifacts
+        id: artifacts
+        working-directory: target
+        shell: bash
         run: |
-          test -f app/build/outputs/apk/debug/app-debug.apk
-          test -f app/build/outputs/apk/release/app-release-unsigned.apk
-          test -f app/build/outputs/bundle/release/app-release.aab
+          set -e
 
-      - name: Verify Android Subdirectory Artifacts
-        if: steps.detect.outputs.type == 'native-subdir' || steps.detect.outputs.type == 'hybrid'
-        run: |
-          test -f android/app/build/outputs/apk/debug/app-debug.apk
-          test -f android/app/build/outputs/apk/release/app-release-unsigned.apk
-          test -f android/app/build/outputs/bundle/release/app-release.aab
+          echo "======================================"
+          echo "BUILD ARTIFACTS"
+          echo "======================================"
 
-      # --------------------------------------------------
-      # Upload APK / AAB
-      # --------------------------------------------------
-      - name: Upload Native APK
-        if: steps.detect.outputs.type == 'native'
+          find . -path "*/build/outputs/*" -type f | sort
+
+          DEBUG_APK=$(find . \
+            -path "*/build/outputs/apk/debug/*.apk" \
+            -type f | head -1)
+
+          RELEASE_APK=$(find . \
+            -path "*/build/outputs/apk/release/*.apk" \
+            -type f | head -1)
+
+          RELEASE_AAB=$(find . \
+            -path "*/build/outputs/bundle/release/*.aab" \
+            -type f | head -1)
+
+          if [ -z "$DEBUG_APK" ]; then
+            echo "ERROR: Debug APK not found."
+            exit 1
+          fi
+
+          if [ -z "$RELEASE_APK" ]; then
+            echo "ERROR: Release APK not found."
+            exit 1
+          fi
+
+          if [ -z "$RELEASE_AAB" ]; then
+            echo "ERROR: Release AAB not found."
+            exit 1
+          fi
+
+          echo "DEBUG_APK=$DEBUG_APK" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_APK=$RELEASE_APK" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_AAB=$RELEASE_AAB" >> "$GITHUB_OUTPUT"
+
+          echo
+          echo "Debug APK:   $DEBUG_APK"
+          echo "Release APK: $RELEASE_APK"
+          echo "Release AAB: $RELEASE_AAB"
+
+      - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: T-Deploy-Debug-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: target/${{ steps.artifacts.outputs.DEBUG_APK }}
           if-no-files-found: error
+          retention-days: 7
 
-      - name: Upload Native Release APK
-        if: steps.detect.outputs.type == 'native'
+      - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
           name: T-Deploy-Release-APK
-          path: app/build/outputs/apk/release/app-release-unsigned.apk
+          path: target/${{ steps.artifacts.outputs.RELEASE_APK }}
           if-no-files-found: error
+          retention-days: 7
 
-      - name: Upload Native AAB
-        if: steps.detect.outputs.type == 'native'
+      - name: Upload Release AAB
         uses: actions/upload-artifact@v4
         with:
           name: T-Deploy-Release-AAB
-          path: app/build/outputs/bundle/release/app-release.aab
+          path: target/${{ steps.artifacts.outputs.RELEASE_AAB }}
           if-no-files-found: error
-
-      - name: Upload Hybrid / Subdirectory APK
-        if: steps.detect.outputs.type == 'native-subdir' || steps.detect.outputs.type == 'hybrid'
-        uses: actions/upload-artifact@v4
-        with:
-          name: T-Deploy-Debug-APK
-          path: android/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-
-      - name: Upload Hybrid / Subdirectory Release APK
-        if: steps.detect.outputs.type == 'native-subdir' || steps.detect.outputs.type == 'hybrid'
-        uses: actions/upload-artifact@v4
-        with:
-          name: T-Deploy-Release-APK
-          path: android/app/build/outputs/apk/release/app-release-unsigned.apk
-          if-no-files-found: error
-
-      - name: Upload Hybrid / Subdirectory AAB
-        if: steps.detect.outputs.type == 'native-subdir' || steps.detect.outputs.type == 'hybrid'
-        uses: actions/upload-artifact@v4
-        with:
-          name: T-Deploy-Release-AAB
-          path: android/app/build/outputs/bundle/release/app-release.aab
-          if-no-files-found: error
+          retention-days: 7
