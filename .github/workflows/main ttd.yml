@@ -1,0 +1,205 @@
+name: T-Deploy Universal Android Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "GitHub repository (owner/name)"
+        required: true
+        default: "siavashhamiri-star/Tdeploy"
+      branch:
+        description: "Branch to build"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Universal Android Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Builder
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            platforms;android-35
+            platforms;android-36
+            build-tools;35.0.0
+            build-tools;36.0.0
+            platform-tools
+
+      - name: Accept Android SDK licenses
+        run: |
+          yes | sdkmanager --licenses || true
+
+      - name: Checkout Target Project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.branch }}
+          path: target
+
+      - name: Detect Project Type
+        id: detect
+        shell: bash
+        run: |
+          set -e
+
+          if { [ -f target/settings.gradle ] || [ -f target/settings.gradle.kts ]; } && [ -d target/app ]; then
+            echo "type=native-root" >> "$GITHUB_OUTPUT"
+            echo "Detected: root Native Android project"
+
+          elif { [ -f target/android/settings.gradle ] || [ -f target/android/settings.gradle.kts ]; } && [ -d target/android/app ]; then
+            echo "type=native-subdir" >> "$GITHUB_OUTPUT"
+            echo "Detected: Android project in /android"
+
+          elif [ -f target/capacitor.config.ts ] || [ -f target/capacitor.config.json ]; then
+            echo "type=hybrid" >> "$GITHUB_OUTPUT"
+            echo "Detected: Capacitor/Hybrid project"
+
+          else
+            echo "ERROR: Unsupported project structure."
+            exit 1
+          fi
+
+      # FIX: The target project expects target/debug.keystore.
+      # Create a standard Android debug keystore automatically.
+      - name: Prepare Debug Keystore
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== Preparing target/debug.keystore ==="
+
+          if [ ! -f target/debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore target/debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          test -f target/debug.keystore
+          ls -lh target/debug.keystore
+
+      - name: Prepare Gradle Wrapper
+        shell: bash
+        run: |
+          set -e
+          cd target
+
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            echo "Existing Gradle Wrapper found."
+            ./gradlew --version
+            exit 0
+          fi
+
+          if [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+
+            DIST_URL=$(grep '^distributionUrl=' gradle/wrapper/gradle-wrapper.properties | cut -d'=' -f2-)
+
+            GRADLE_VERSION=$(printf '%s' "$DIST_URL" | sed -E 's#.*gradle-([0-9.]+)-.*#\1#')
+
+            if [ -n "$GRADLE_VERSION" ] && printf '%s' "$GRADLE_VERSION" | grep -Eq '^[0-9]+(\.[0-9]+){1,2}$'; then
+              echo "Detected Gradle version: $GRADLE_VERSION"
+              gradle wrapper --gradle-version "$GRADLE_VERSION"
+            else
+              echo "Could not parse wrapper version; using Gradle 9.3.1."
+              gradle wrapper --gradle-version 9.3.1
+            fi
+
+          else
+            echo "No Gradle wrapper metadata; using Gradle 9.3.1."
+            gradle wrapper --gradle-version 9.3.1
+          fi
+
+          chmod +x ./gradlew
+          ./gradlew --version
+
+      - name: Configure Hybrid Dependencies
+        if: steps.detect.outputs.type == 'hybrid'
+        shell: bash
+        run: |
+          set -e
+          cd target
+          npm install
+          npm run build
+          npx cap sync android
+
+      - name: Build Native Root APK
+        if: steps.detect.outputs.type == 'native-root'
+        working-directory: target
+        shell: bash
+        run: |
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon
+          ./gradlew :app:assembleRelease --stacktrace --no-daemon || true
+          ./gradlew :app:bundleRelease --stacktrace --no-daemon || true
+
+      - name: Build Native Android Subdirectory
+        if: steps.detect.outputs.type == 'native-subdir'
+        working-directory: target/android
+        shell: bash
+        run: |
+          ../gradlew :app:assembleDebug --stacktrace --no-daemon
+          ../gradlew :app:assembleRelease --stacktrace --no-daemon || true
+          ../gradlew :app:bundleRelease --stacktrace --no-daemon || true
+
+      - name: Build Hybrid Android
+        if: steps.detect.outputs.type == 'hybrid'
+        working-directory: target/android
+        shell: bash
+        run: |
+          ../gradlew :app:assembleDebug --stacktrace --no-daemon
+          ../gradlew :app:assembleRelease --stacktrace --no-daemon || true
+          ../gradlew :app:bundleRelease --stacktrace --no-daemon || true
+
+      - name: Collect Build Artifacts
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p artifacts
+
+          echo "=== Searching for APK/AAB files ==="
+
+          find target -type f \( \
+            -name "*.apk" -o \
+            -name "*.aab" \
+          \) -print
+
+          find target -type f -name "*.apk" -exec cp {} artifacts/ \; || true
+          find target -type f -name "*.aab" -exec cp {} artifacts/ \; || true
+
+          echo "=== Final Artifacts ==="
+          ls -lah artifacts
+
+          if ! find artifacts -type f | grep -Eq '\.(apk|aab)$'; then
+            echo "ERROR: No APK/AAB artifact was generated."
+            exit 1
+          fi
+
+      - name: Upload APK/AAB Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: T-Deploy-Android-Artifacts
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
