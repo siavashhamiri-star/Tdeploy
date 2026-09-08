@@ -1,0 +1,220 @@
+name: T-Deploy Universal Android Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "GitHub repository (owner/name)"
+        required: true
+        type: string
+      branch:
+        description: "Branch"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Universal Android APK & AAB
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout T-Deploy
+        uses: actions/checkout@v4
+
+      - name: Checkout Target Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.branch }}
+          path: target
+          fetch-depth: 1
+
+      - name: Inspect Target
+        working-directory: target
+        run: |
+          echo "===== TARGET ====="
+          echo "Repository: ${{ inputs.repository }}"
+          echo "Branch: ${{ inputs.branch }}"
+          echo
+          find . -maxdepth 3 -type f | sort | head -300
+
+      - name: Detect Android Project
+        id: detect
+        working-directory: target
+        shell: bash
+        run: |
+          set -e
+
+          if [ -f "settings.gradle" ] || [ -f "settings.gradle.kts" ]; then
+            if [ -d "app" ]; then
+              echo "type=native" >> "$GITHUB_OUTPUT"
+              echo "dir=." >> "$GITHUB_OUTPUT"
+              echo "Detected Native Android project at root."
+              exit 0
+            fi
+          fi
+
+          if [ -f "android/settings.gradle" ] || [ -f "android/settings.gradle.kts" ]; then
+            if [ -d "android/app" ]; then
+              echo "type=native-subdir" >> "$GITHUB_OUTPUT"
+              echo "dir=android" >> "$GITHUB_OUTPUT"
+              echo "Detected Native Android project under android/."
+              exit 0
+            fi
+          fi
+
+          if [ -f "capacitor.config.ts" ] || [ -f "capacitor.config.json" ]; then
+            echo "type=hybrid" >> "$GITHUB_OUTPUT"
+            echo "dir=android" >> "$GITHUB_OUTPUT"
+            echo "Detected Capacitor project."
+            exit 0
+          fi
+
+          echo "ERROR: No supported Android project detected."
+          echo
+          echo "Repository structure:"
+          find . -maxdepth 4 -type f | sort
+          exit 1
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK
+        run: |
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Prepare Gradle Wrapper
+        working-directory: target
+        shell: bash
+        run: |
+          set -e
+
+          if [ "${{ steps.detect.outputs.dir }}" = "." ]; then
+            PROJECT_DIR="."
+          else
+            PROJECT_DIR="android"
+          fi
+
+          cd "$PROJECT_DIR"
+
+          if [ -f "./gradlew" ]; then
+            echo "Existing Gradle Wrapper found."
+            chmod +x ./gradlew
+          else
+            echo "Gradle Wrapper not found."
+            echo "Generating wrapper..."
+
+            gradle wrapper --gradle-version 8.9
+
+            chmod +x ./gradlew
+          fi
+
+          ./gradlew --version
+
+      - name: Install Node.js
+        if: steps.detect.outputs.type == 'hybrid'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build Web Application
+        if: steps.detect.outputs.type == 'hybrid'
+        working-directory: target
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+          npm run build
+
+      - name: Sync Capacitor
+        if: steps.detect.outputs.type == 'hybrid'
+        working-directory: target
+        run: |
+          npx cap sync android
+
+      - name: Build Native Android
+        if: steps.detect.outputs.type == 'native'
+        working-directory: target
+        run: |
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon
+          ./gradlew :app:assembleRelease --stacktrace --no-daemon
+          ./gradlew :app:bundleRelease --stacktrace --no-daemon
+
+      - name: Build Android Subdirectory
+        if: steps.detect.outputs.type == 'native-subdir' || steps.detect.outputs.type == 'hybrid'
+        working-directory: target/android
+        run: |
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon
+          ./gradlew :app:assembleRelease --stacktrace --no-daemon
+          ./gradlew :app:bundleRelease --stacktrace --no-daemon
+
+      - name: Find APK and AAB
+        id: artifacts
+        working-directory: target
+        shell: bash
+        run: |
+          set -e
+
+          echo "===== OUTPUTS ====="
+          find . -path "*/build/outputs/*" -type f | sort
+
+          DEBUG_APK=$(find . \
+            -path "*/build/outputs/apk/debug/*.apk" \
+            -type f | head -1)
+
+          RELEASE_APK=$(find . \
+            -path "*/build/outputs/apk/release/*.apk" \
+            -type f | head -1)
+
+          RELEASE_AAB=$(find . \
+            -path "*/build/outputs/bundle/release/*.aab" \
+            -type f | head -1)
+
+          test -n "$DEBUG_APK"
+          test -n "$RELEASE_APK"
+          test -n "$RELEASE_AAB"
+
+          echo "debug=$DEBUG_APK" >> "$GITHUB_OUTPUT"
+          echo "release=$RELEASE_APK" >> "$GITHUB_OUTPUT"
+          echo "aab=$RELEASE_AAB" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: T-Deploy-Debug-APK
+          path: target/${{ steps.artifacts.outputs.debug }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: T-Deploy-Release-APK
+          path: target/${{ steps.artifacts.outputs.release }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Release AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: T-Deploy-Release-AAB
+          path: target/${{ steps.artifacts.outputs.aab }}
+          if-no-files-found: error
+          retention-days: 7
