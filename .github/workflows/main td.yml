@@ -92,10 +92,14 @@ jobs:
 
       - name: Install Android SDK
         run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
           sdkmanager \
             "platform-tools" \
             "platforms;android-35" \
-            "build-tools;35.0.0"
+            "build-tools;35.0.0" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
 
       - name: Prepare Gradle Wrapper
         working-directory: target
@@ -114,15 +118,40 @@ jobs:
           if [ -f "./gradlew" ]; then
             echo "Existing Gradle Wrapper found."
             chmod +x ./gradlew
-          else
-            echo "Gradle Wrapper not found."
-            echo "Generating wrapper..."
 
-            gradle wrapper --gradle-version 8.9
+          elif [ -f "gradle/wrapper/gradle-wrapper.properties" ]; then
+            echo "Gradle wrapper properties found."
+
+            DISTRIBUTION_URL=$(grep '^distributionUrl=' gradle/wrapper/gradle-wrapper.properties | sed 's/^distributionUrl=//' | sed 's/\\:/:/g')
+
+            echo "Configured Gradle distribution:"
+            echo "$DISTRIBUTION_URL"
+
+            GRADLE_VERSION=$(echo "$DISTRIBUTION_URL" | sed -n 's#.*gradle-\([0-9][0-9.]*\)-.*#\1#p')
+
+            if [ -z "$GRADLE_VERSION" ]; then
+              echo "Could not detect Gradle version."
+              echo "Using Gradle 9.3.1 fallback."
+              GRADLE_VERSION="9.3.1"
+            fi
+
+            echo "Using Gradle version: $GRADLE_VERSION"
+
+            gradle wrapper --gradle-version "$GRADLE_VERSION"
+
+            chmod +x ./gradlew
+
+          else
+            echo "No Gradle Wrapper found."
+            echo "Using Gradle 9.3.1 fallback."
+
+            gradle wrapper --gradle-version 9.3.1
 
             chmod +x ./gradlew
           fi
 
+          echo
+          echo "===== GRADLE VERSION ====="
           ./gradlew --version
 
       - name: Install Node.js
@@ -172,7 +201,8 @@ jobs:
         run: |
           set -e
 
-          echo "===== OUTPUTS ====="
+          echo "===== BUILD OUTPUTS ====="
+
           find . -path "*/build/outputs/*" -type f | sort
 
           DEBUG_APK=$(find . \
@@ -186,6 +216,11 @@ jobs:
           RELEASE_AAB=$(find . \
             -path "*/build/outputs/bundle/release/*.aab" \
             -type f | head -1)
+
+          echo
+          echo "Debug APK:   $DEBUG_APK"
+          echo "Release APK: $RELEASE_APK"
+          echo "Release AAB: $RELEASE_AAB"
 
           test -n "$DEBUG_APK"
           test -n "$RELEASE_APK"
@@ -217,4 +252,4 @@ jobs:
           name: T-Deploy-Release-AAB
           path: target/${{ steps.artifacts.outputs.aab }}
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 7 inch 
